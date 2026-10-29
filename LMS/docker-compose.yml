@@ -1,0 +1,241 @@
+# =============================================================================
+# Library Management System - one-command development stack.
+#
+#   postgres        booking write model (holds, loans, copies, fines, outbox)
+#   mongo           catalog source of truth (replica set because CDC needs it)
+#   elasticsearch   derived search index (books alias)
+#   redis           availability/search/book caches
+#   kafka           event backbone
+#   kafka-connect   Debezium MongoDB connector runtime
+#   connector-init  registers the Debezium connector once
+#   app             the NestJS monolith
+#
+# Run: docker compose up --build -d
+# =============================================================================
+name: lms
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: lms-postgres
+    environment:
+      POSTGRES_USER: lms
+      POSTGRES_PASSWORD: lms
+      POSTGRES_DB: lms
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./init/postgres:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lms -d lms"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  mongo:
+    image: mongo:7
+    container_name: lms-mongo
+    command: ["--replSet", "rs0", "--bind_ip_all"]
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      test: ["CMD-SHELL", "mongosh --quiet --eval \"db.adminCommand('ping').ok\" | grep 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  # MongoDB must be a replica set before Debezium can read its change stream.
+  mongo-init:
+    image: mongo:7
+    container_name: lms-mongo-init
+    depends_on:
+      mongo:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command: >
+      "mongosh --host mongo:27017 --quiet --eval '
+        try { rs.status(); print(\"replica set already initiated\"); }
+        catch (e) {
+          rs.initiate({ _id: \"rs0\", members: [{ _id: 0, host: \"mongo:27017\" }] });
+          print(\"replica set initiated\");
+        }
+        for (let i = 0; i < 120; i++) {
+          const hello = db.hello();
+          if (hello.isWritablePrimary) { print(\"mongo primary ready\"); quit(0); }
+          sleep(500);
+        }
+        print(\"mongo primary did not become ready\"); quit(1);'"
+    restart: "no"
+
+  # Seed data can only be written once the replica set has a primary.
+  # Debezium's initial snapshot then captures these existing documents.
+  mongo-seed:
+    image: mongo:7
+    container_name: lms-mongo-seed
+    depends_on:
+      mongo-init:
+        condition: service_completed_successfully
+    volumes:
+      - ./init/mongo:/seed:ro
+    command: ["mongosh", "--quiet", "mongodb://mongo:27017/lms?directConnection=true", "/seed/01-catalog.js"]
+    restart: "no"
+
+  redis:
+    image: redis:7-alpine
+    container_name: lms-redis
+    command: ["redis-server", "--appendonly", "no"]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.13.4
+    container_name: lms-elasticsearch
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - xpack.security.enrollment.enabled=false
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+      - bootstrap.memory_lock=true
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    ports:
+      - "9200:9200"
+    volumes:
+      - es-data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health | grep -E '\"status\":\"(green|yellow)\"'"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: lms-kafka
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://kafka:9092,CONTROLLER://kafka:9093,EXTERNAL://0.0.0.0:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+    ports:
+      - "29092:29092"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server kafka:9092 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 30s
+
+  # Explicit topic creation so consumers never race topic auto-creation.
+  kafka-init:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: lms-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "/scripts/topics.sh"]
+    volumes:
+      - ./init/kafka:/scripts:ro
+    restart: "no"
+
+  kafka-connect:
+    image: debezium/connect:2.5.0.Final
+    container_name: lms-kafka-connect
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      BOOTSTRAP_SERVERS: kafka:9092
+      GROUP_ID: lms-connect
+      CONFIG_STORAGE_TOPIC: lms_connect_configs
+      OFFSET_STORAGE_TOPIC: lms_connect_offsets
+      STATUS_STORAGE_TOPIC: lms_connect_statuses
+      CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      STATUS_STORAGE_REPLICATION_FACTOR: 1
+      KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      KEY_CONVERTER_SCHEMAS_ENABLE: "false"
+      VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
+    ports:
+      - "8083:8083"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8083/ >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  # Registers the Debezium MongoDB source connector exactly once.
+  connector-init:
+    image: curlimages/curl:8.7.1
+    container_name: lms-connector-init
+    depends_on:
+      kafka-connect:
+        condition: service_healthy
+      mongo-seed:
+        condition: service_completed_successfully
+    volumes:
+      - ./debezium:/debezium:ro
+    entrypoint: ["/bin/sh", "/debezium/register-connector.sh"]
+    restart: "no"
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: lms-app
+    env_file:
+      - .env.dev
+    ports:
+      - "3000:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mongo:
+        condition: service_healthy
+      mongo-seed:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/health/live >/dev/null"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  mongo-data:
+  es-data:
+  kafka-data:
